@@ -36,6 +36,7 @@ fn every_option_set() -> Options {
         pane_frames: Some(false),
         pane_frame_style: Some(PaneFrameStyle::Full),
         mirror_session: Some(true),
+        resize_to_latest_input: Some(true),
         on_force_close: Some(OnForceClose::Quit),
         scroll_buffer_size: Some(5000),
         copy_command: Some("wl-copy".to_owned()),

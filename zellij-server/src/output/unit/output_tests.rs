@@ -1,6 +1,6 @@
 use super::super::{
     CharacterChunk, FloatingPanesStack, HostKittyState, KittyImageChunk, Output, OutputBuffer,
-    SixelImageChunk,
+    RenderPayload, SixelImageChunk,
 };
 use crate::panes::kitty_graphics::parser::{
     DecodedImage, KittyAction, KittyCommandParser, KittyFormat,
@@ -363,6 +363,72 @@ fn test_serialize_drains_state() {
     assert!(
         result2.is_empty(),
         "Second serialize should return empty HashMap"
+    );
+}
+
+#[test]
+fn client_bounds_crop_text_and_cursor_only_for_the_bounded_client() {
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(2);
+    output.add_clients(&client_ids, Rc::new(RefCell::new(LinkHandler::new())), None);
+    output
+        .add_character_chunks_to_multiple_clients(
+            vec![
+                create_character_chunk_from_str("A界Z", 1, 0),
+                create_character_chunk_from_str("below", 0, 2),
+            ],
+            client_ids.iter().copied(),
+            None,
+        )
+        .unwrap();
+    output.add_pre_vte_instruction_to_client(1, "\u{1b}[?25l");
+    output.add_post_vte_cursor_instruction_to_client(1, 1, 2, Some("\u{1b}[2 q"));
+    output.add_post_vte_cursor_instruction_to_client(2, 1, 0, Some("\u{1b}[2 q"));
+    output.add_post_vte_instruction_to_multiple_clients(client_ids.iter().copied(), "\u{7}");
+
+    let result = output
+        .serialize_with_client_bounds(|client_id| {
+            (client_id == 1).then_some((Size { rows: 2, cols: 5 }, Size { rows: 4, cols: 3 }))
+        })
+        .unwrap();
+    let bounded = result[&1].ansi();
+    assert!(bounded.starts_with("\u{1b}[?25l"));
+    assert!(bounded.contains("\u{1b}[1;2H\u{1b}[mA"));
+    assert!(!bounded.contains('界'));
+    assert!(!bounded.contains("below"));
+    assert!(!bounded.contains("\u{1b}[?25h"));
+    assert!(!bounded.contains("\u{1b}[3;2H"));
+    assert!(bounded.ends_with("\u{1b}[?25l\u{7}"));
+    assert!(bounded.contains("\u{1b}[1;4H\u{1b}[m\u{1b}[K"));
+    assert!(bounded.contains("\u{1b}[2;4H\u{1b}[m\u{1b}[K"));
+    assert_eq!(bounded.matches("\u{1b}[K").count(), 2);
+    assert!(!bounded.contains("\u{1b}[J"));
+
+    let unbounded = result[&2].ansi();
+    assert!(unbounded.contains("A界Z"));
+    assert!(unbounded.contains("below"));
+    assert!(unbounded.ends_with("\u{1b}[?25h\u{1b}[1;2H\u{1b}[m\u{1b}[2 q\u{7}"));
+    assert!(!unbounded.contains("\u{1b}[K"));
+    assert!(!output.is_dirty());
+    assert!(output.serialize().unwrap().is_empty());
+}
+
+#[test]
+fn client_bounds_pad_only_the_bottom_when_the_client_is_narrower() {
+    let mut output = create_test_output();
+    output.add_clients(
+        &create_test_clients(1),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        None,
+    );
+    output.add_post_vte_cursor_instruction_to_client(1, 0, 1, None);
+
+    let result = output
+        .serialize_with_client_bounds(|_| Some((Size { rows: 5, cols: 2 }, Size { rows: 3, cols: 4 })))
+        .unwrap();
+    assert_eq!(
+        result[&1].ansi(),
+        "\u{1b}[s\u{1b}[4;1H\u{1b}[m\u{1b}[J\u{1b}[u\u{1b}[?25l\u{1b}[2;1H"
     );
 }
 
@@ -1630,6 +1696,170 @@ fn parse_kitty_placement_crops(output: &str) -> Vec<(usize, usize, usize, usize,
 }
 
 #[test]
+fn client_bounds_crop_kitty_placements_without_losing_host_state() {
+    let parts = create_test_kitty_parts();
+    let internal = store_test_kitty_image(&parts.0, 30, 40);
+    let mut visible = kitty_chunk(internal, 1, 1, 1);
+    visible.cell_offset_x = 2;
+    visible.cell_offset_y = 3;
+    let clipped = kitty_chunk(internal, 2, 1, 2);
+    let render = |chunks| {
+        let mut output = create_test_kitty_output(&parts);
+        output.add_clients(
+            &create_test_clients(1),
+            Rc::new(RefCell::new(LinkHandler::new())),
+            None,
+        );
+        output.add_kitty_image_chunks_to_client(1, PaneId::Terminal(1), chunks, None);
+        let RenderPayload::Ansi(frame) = output
+            .serialize_with_client_bounds(|_| {
+                Some((Size { rows: 2, cols: 2 }, Size { rows: 4, cols: 4 }))
+            })
+            .unwrap()
+            .remove(&1)
+            .unwrap()
+        else {
+            panic!("expected an ANSI payload");
+        };
+        frame
+    };
+
+    let first = render(vec![visible, clipped]);
+    assert!(first.contains("\u{1b}_Ga=t"));
+    assert_eq!(parse_kitty_placement_crops(&first), vec![(1, 1, 0, 0, 8, 17)]);
+    assert!(render(vec![visible, clipped]).is_empty());
+    let removed = render(vec![clipped]);
+    assert!(removed.contains("\u{1b}_Ga=d,q=2,d=i"));
+    assert!(!removed.contains("\u{1b}_Ga=p"));
+}
+
+#[test]
+fn structured_client_bounds_clip_text_geometry_cursor_and_images() {
+    use super::super::PaneScroll;
+    use crate::panes::sixel::SixelGrid;
+    use zellij_utils::structured_render::{decode, GraphicsRecord, PaneRect};
+
+    let parts = create_test_kitty_parts();
+    let mut output = create_test_kitty_output(&parts);
+    let physical = Size { rows: 2, cols: 5 };
+    let content = Size { rows: 4, cols: 3 };
+    {
+        let mut clients = output.structured_render_clients.borrow_mut();
+        let state = clients.entry(1).or_default();
+        state.enabled = true;
+        state.reset_viewport(physical);
+    }
+    output.add_clients(
+        &create_test_clients(1),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        None,
+    );
+    output
+        .add_character_chunks_to_client(
+            1,
+            vec![
+                create_character_chunk_from_str("A界Z", 1, 0),
+                create_character_chunk_from_str("below", 0, 2),
+            ],
+            None,
+        )
+        .unwrap();
+    output.set_client_cursor(1, 1, 2, true, "\u{1b}[2 q");
+    output.add_post_vte_cursor_instruction_to_client(1, 1, 2, Some("\u{1b}[2 q"));
+    output.add_post_vte_instruction_to_client(1, "\u{7}");
+
+    let pane = PaneId::Terminal(1);
+    output.add_pane_rect(
+        1,
+        PaneRect {
+            cols: 3,
+            rows: 4,
+            ..Default::default()
+        },
+        PaneScroll::of(pane, None),
+    );
+    let image = store_test_kitty_image(&parts.0, 30, 40);
+    let mut visible = kitty_chunk(image, 1, 2, 1);
+    visible.cell_offset_x = 2;
+    visible.cell_offset_y = 3;
+    output.add_kitty_image_chunks_to_client(
+        1,
+        pane,
+        vec![visible, kitty_chunk(image, 2, 1, 2)],
+        None,
+    );
+    output.sixel_host_capabilities.borrow_mut().insert(1, true);
+    let mut sixel_grid = SixelGrid::new(
+        output.character_cell_size.clone(),
+        output.sixel_image_store.clone(),
+    );
+    let sixel = sixel_image::SixelImage::new(
+        b"\x1bP9;1q\"1;1;30;24#1;2;100;0;0#1!30~-!30~-!30~-!30~\x1b\\",
+    )
+    .unwrap();
+    let sixel_id = sixel_grid.next_image_id();
+    sixel_grid.new_sixel_image(sixel_id, sixel);
+    let visible_sixel = SixelImageChunk {
+        cell_x: 2,
+        cell_y: 1,
+        sixel_image_pixel_width: 30,
+        sixel_image_pixel_height: 24,
+        sixel_image_id: sixel_id,
+        ..Default::default()
+    };
+    let hidden_sixel = SixelImageChunk {
+        cell_x: 3,
+        ..visible_sixel
+    };
+    output.add_sixel_image_chunks_to_client(1, vec![visible_sixel, hidden_sixel], None);
+
+    let result = output
+        .serialize_with_client_bounds(|_| Some((physical, content)))
+        .unwrap();
+    let frame = result[&1].frame().unwrap();
+    let view = decode(frame).unwrap();
+    assert_eq!((view.header().cols, view.header().rows), (5, 2));
+    assert_eq!(
+        watcher_text(frame, physical.cols, physical.rows),
+        [" A   ", "     "]
+    );
+    assert!(!view.cursor().visible);
+    assert_eq!(view.sideband(), b"\x07");
+    let panes = view.geometry().unwrap().panes;
+    assert_eq!(panes.len(), 1);
+    assert_eq!((panes[0].cols, panes[0].rows), (3, 2));
+    let graphics = view.graphics();
+    let placements: Vec<_> = graphics
+        .iter()
+        .filter_map(|record| match *record {
+            GraphicsRecord::Placement {
+                cell_x,
+                cell_y,
+                source_width,
+                source_height,
+                ..
+            } => Some((cell_x, cell_y, source_width, source_height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(placements, [(2, 1, 8, 17)]);
+    let sixels: Vec<_> = graphics
+        .iter()
+        .filter_map(|record| match *record {
+            GraphicsRecord::SixelChunk {
+                cell_x,
+                cell_y,
+                pixel_width,
+                pixel_height,
+                ..
+            } => Some((cell_x, cell_y, pixel_width, pixel_height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sixels, [(2, 1, 10, 20)]);
+}
+
+#[test]
 fn kitty_transmit_only_once_across_frames() {
     let parts = create_test_kitty_parts();
     let internal = store_test_kitty_image(&parts.0, 30, 40);
@@ -2891,8 +3121,21 @@ fn family_cells() -> Vec<TerminalCharacter> {
 }
 
 fn ansi_for(chunk: CharacterChunk, max_size: Option<Size>) -> String {
-    super::super::serialize_chunks(vec![chunk], None, None, None, true, true, max_size, None)
-        .unwrap()
+    let mut output = String::new();
+    super::super::serialize_chunks(
+        &mut output,
+        vec![chunk],
+        None,
+        None,
+        None,
+        true,
+        true,
+        max_size,
+        None,
+        None,
+    )
+    .unwrap();
+    output
 }
 
 fn grouped_chunk(cells: Vec<TerminalCharacter>, x: usize, y: usize) -> CharacterChunk {

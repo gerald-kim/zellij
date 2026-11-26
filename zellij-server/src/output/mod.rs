@@ -50,6 +50,97 @@ const SHM_DIR: &str = "/dev/shm";
 const MAX_TRACKED_MEDIA_FILES: usize = 512;
 static NEXT_MEDIA_FILE: AtomicU64 = AtomicU64::new(0);
 
+const SAVE_CURSOR_POSITION: &str = "\u{1b}[s";
+const RESTORE_CURSOR_POSITION: &str = "\u{1b}[u";
+
+fn position_is_in_bounds(x: usize, y: usize, size: Size) -> bool {
+    x < size.cols && y < size.rows
+}
+
+// Unlike watcher padding, clear only the margins that fit on the physical client.
+fn write_client_padding(vte_output: &mut String, max_size: Size, content_size: Size) -> Result<()> {
+    if max_size.rows == 0 || max_size.cols == 0 {
+        return Ok(());
+    }
+    let right_padding_rows = if max_size.cols > content_size.cols {
+        max_size.rows.min(content_size.rows)
+    } else {
+        0
+    };
+    let has_bottom_padding = max_size.rows > content_size.rows;
+    if right_padding_rows > 0 || has_bottom_padding {
+        vte_output.push_str(SAVE_CURSOR_POSITION);
+        for y in 0..right_padding_rows {
+            vte_goto_instruction(content_size.cols, y, vte_output)?;
+            vte_output.push_str("\u{1b}[K");
+        }
+        if has_bottom_padding {
+            vte_goto_instruction(0, content_size.rows, vte_output)?;
+            vte_output.push_str("\u{1b}[J");
+        }
+        vte_output.push_str(RESTORE_CURSOR_POSITION);
+    }
+    Ok(())
+}
+
+fn remaining_pixels(x: usize, y: usize, max_size: Size, cell_size: SizeInPixels) -> SizeInPixels {
+    SizeInPixels {
+        width: (max_size.cols - x).saturating_mul(cell_size.width),
+        height: (max_size.rows - y).saturating_mul(cell_size.height),
+    }
+}
+
+fn clip_kitty_chunk(
+    chunk: &mut KittyImageChunk,
+    max_size: Size,
+    cell_size: Option<SizeInPixels>,
+) -> bool {
+    if !position_is_in_bounds(chunk.cell_x, chunk.cell_y, max_size) {
+        return false;
+    }
+    if let Some(cell_size) = cell_size {
+        let available = remaining_pixels(chunk.cell_x, chunk.cell_y, max_size, cell_size);
+        chunk.source_px_width = chunk
+            .source_px_width
+            .min(available.width.saturating_sub(chunk.cell_offset_x as usize));
+        chunk.source_px_height = chunk
+            .source_px_height
+            .min(available.height.saturating_sub(chunk.cell_offset_y as usize));
+        return chunk.source_px_width != 0 && chunk.source_px_height != 0;
+    }
+    true
+}
+
+fn sixel_dimensions(
+    chunk: &SixelImageChunk,
+    max_size: Option<Size>,
+    cell_size: Option<SizeInPixels>,
+) -> Option<(usize, usize)> {
+    let mut width = chunk.sixel_image_pixel_width;
+    let mut height = chunk.sixel_image_pixel_height;
+    if let Some(size) = max_size {
+        if !position_is_in_bounds(chunk.cell_x, chunk.cell_y, size) {
+            return None;
+        }
+        if let Some(cell_size) = cell_size {
+            let available = remaining_pixels(chunk.cell_x, chunk.cell_y, size, cell_size);
+            width = width.min(available.width);
+            height = height.min(available.height);
+            if width == 0 || height == 0 {
+                return None;
+            }
+        }
+    }
+    Some((width, height))
+}
+
+fn begin_image_output(vte_output: &mut String, has_image_output: &mut bool) {
+    if !*has_image_output {
+        vte_output.push_str(SAVE_CURSOR_POSITION);
+        *has_image_output = true;
+    }
+}
+
 fn vte_goto_instruction(x_coords: usize, y_coords: usize, vte_output: &mut String) -> Result<()> {
     write!(
         vte_output,
@@ -641,11 +732,16 @@ fn flatten_chunks(
     mut links: Option<&mut LinkFlatten<'_>>,
     builder: &mut FrameBuilder,
     shift_panes: Option<&[(PaneRect, PaneScroll)]>,
+    max_size: Option<Size>,
+    character_cell_size: Option<SizeInPixels>,
 ) -> Result<()> {
     let err_context = || "failed to flatten input chunks".to_string();
 
-    let cols = builder.cols() as usize;
-    let rows = builder.rows() as usize;
+    let frame_cols = builder.cols() as usize;
+    let frame_rows = builder.rows() as usize;
+    let (cols, rows) = max_size
+        .map(|size| (size.cols.min(frame_cols), size.rows.min(frame_rows)))
+        .unwrap_or((frame_cols, frame_rows));
     let shifts = shift_panes
         .map(|panes| row_shifts_for(&character_chunks, panes, cols, rows))
         .unwrap_or_default();
@@ -735,7 +831,7 @@ fn flatten_chunks(
                 };
                 if let Some(links) = links.as_deref_mut() {
                     if let Some(uri) = links.handler.uri(t_character.styles.link_anchor) {
-                        cell.link = links.table.id_for(uri, cols, rows);
+                        cell.link = links.table.id_for(uri, frame_cols, frame_rows);
                     }
                 }
                 chunk_width += t_character.width();
@@ -797,7 +893,7 @@ fn flatten_chunks(
                 }
                 if let Some(links) = links.as_deref_mut() {
                     if let Some(uri) = links.handler.uri(member.styles.link_anchor) {
-                        cell.link = links.table.id_for(uri, cols, rows);
+                        cell.link = links.table.id_for(uri, frame_cols, frame_rows);
                     }
                 }
                 chunk_width += member.width();
@@ -834,15 +930,19 @@ fn flatten_chunks(
     if let Some(sixel_image_store) = sixel_image_store {
         if let Some(sixel_chunks) = sixel_chunks {
             for sixel_chunk in sixel_chunks {
-                if sixel_chunk.cell_y >= rows || sixel_chunk.cell_x >= cols {
+                let Some((pixel_width, pixel_height)) = sixel_dimensions(
+                    sixel_chunk,
+                    Some(Size { rows, cols }),
+                    character_cell_size,
+                ) else {
                     continue;
-                }
+                };
                 let serialized_sixel_image = sixel_image_store.serialize_image(
                     sixel_chunk.sixel_image_id,
                     sixel_chunk.sixel_image_pixel_x,
                     sixel_chunk.sixel_image_pixel_y,
-                    sixel_chunk.sixel_image_pixel_width,
-                    sixel_chunk.sixel_image_pixel_height,
+                    pixel_width,
+                    pixel_height,
                 );
                 if let Some(serialized_sixel_image) = serialized_sixel_image {
                     records.push(GraphicsRecord::SixelChunk {
@@ -850,8 +950,8 @@ fn flatten_chunks(
                         cell_y: sixel_chunk.cell_y as u32,
                         pixel_x: sixel_chunk.sixel_image_pixel_x as u32,
                         pixel_y: sixel_chunk.sixel_image_pixel_y as u32,
-                        pixel_width: sixel_chunk.sixel_image_pixel_width as u32,
-                        pixel_height: sixel_chunk.sixel_image_pixel_height as u32,
+                        pixel_width: pixel_width as u32,
+                        pixel_height: pixel_height as u32,
                         payload: serialized_sixel_image.into_bytes(),
                     });
                 }
@@ -920,6 +1020,7 @@ fn write_unit_text(
 }
 
 fn serialize_chunks(
+    vte_output: &mut String,
     character_chunks: Vec<CharacterChunk>,
     sixel_chunks: Option<&Vec<SixelImageChunk>>,
     link_handler: Option<&mut Rc<RefCell<LinkHandler>>>,
@@ -927,29 +1028,24 @@ fn serialize_chunks(
     styled_underlines: bool,
     osc8_hyperlinks: bool,
     max_size: Option<Size>,
+    character_cell_size: Option<SizeInPixels>,
     kitty_input: Option<KittyFrameInput>,
-) -> Result<String> {
+) -> Result<()> {
     let err_context = || "failed to serialize input chunks".to_string();
 
-    let mut vte_output = String::new();
-    let mut sixel_vte: Option<String> = None;
     let link_handler = link_handler.map(|l_h| l_h.borrow());
     for character_chunk in character_chunks {
-        // Skip chunks that are completely outside the size bounds
-        if let Some(size) = max_size {
-            if character_chunk.y >= size.rows {
-                continue; // Chunk is below visible area
-            }
-            if character_chunk.x >= size.cols {
-                continue; // Chunk starts outside visible area
-            }
+        if max_size
+            .is_some_and(|size| !position_is_in_bounds(character_chunk.x, character_chunk.y, size))
+        {
+            continue;
         }
 
         let chunk_changed_colors = character_chunk.changed_colors();
         let pane_default_fg = character_chunk.pane_default_fg;
         let pane_default_bg = character_chunk.pane_default_bg;
         let mut character_styles = DEFAULT_STYLES.enable_styled_underlines(styled_underlines);
-        vte_goto_instruction(character_chunk.x, character_chunk.y, &mut vte_output)
+        vte_goto_instruction(character_chunk.x, character_chunk.y, vte_output)
             .with_context(err_context)?;
         // A chunk marked `erase_first` starts in the middle of a row where a floating pane cut
         // off its left part (see `remove_covered_parts`). The host may still show part of a
@@ -990,12 +1086,12 @@ fn serialize_chunks(
                     chunk_changed_colors,
                     link_handler.as_ref(),
                     osc8_hyperlinks,
-                    &mut vte_output,
+                    vte_output,
                 )
                 .with_context(err_context)?;
                 if t_character.has_attached() {
                     write_unit_text(
-                        &mut vte_output,
+                        vte_output,
                         std::slice::from_ref(t_character),
                         t_character.width(),
                         chunk_width,
@@ -1050,67 +1146,53 @@ fn serialize_chunks(
                 chunk_changed_colors,
                 link_handler.as_ref(),
                 osc8_hyperlinks,
-                &mut vte_output,
+                vte_output,
             )
             .with_context(err_context)?;
             if unit_end == index + 1 && !t_character.has_attached() {
                 vte_output.push(t_character.character);
             } else {
-                write_unit_text(&mut vte_output, unit, unit_columns, chunk_width)
+                write_unit_text(vte_output, unit, unit_columns, chunk_width)
                     .with_context(err_context)?;
             }
             chunk_width += unit_columns;
             index = unit_end;
         }
     }
+    // Images go after text because their stacking order is handled by the terminal.
     if let Some(sixel_image_store) = sixel_image_store {
         if let Some(sixel_chunks) = sixel_chunks {
+            let mut has_sixel_output = false;
             for sixel_chunk in sixel_chunks {
-                // Skip sixel chunks that are completely outside the size bounds
-                if let Some(size) = max_size {
-                    if sixel_chunk.cell_y >= size.rows {
-                        continue; // Sixel chunk is below visible area
-                    }
-                    if sixel_chunk.cell_x >= size.cols {
-                        continue; // Sixel chunk starts outside visible area
-                    }
-                }
+                let Some((pixel_width, pixel_height)) =
+                    sixel_dimensions(sixel_chunk, max_size, character_cell_size)
+                else {
+                    continue;
+                };
 
                 let serialized_sixel_image = sixel_image_store.serialize_image(
                     sixel_chunk.sixel_image_id,
                     sixel_chunk.sixel_image_pixel_x,
                     sixel_chunk.sixel_image_pixel_y,
-                    sixel_chunk.sixel_image_pixel_width,
-                    sixel_chunk.sixel_image_pixel_height,
+                    pixel_width,
+                    pixel_height,
                 );
                 if let Some(serialized_sixel_image) = serialized_sixel_image {
-                    let sixel_vte = sixel_vte.get_or_insert_with(String::new);
-                    vte_goto_instruction(sixel_chunk.cell_x, sixel_chunk.cell_y, sixel_vte)
+                    begin_image_output(vte_output, &mut has_sixel_output);
+                    vte_goto_instruction(sixel_chunk.cell_x, sixel_chunk.cell_y, vte_output)
                         .with_context(err_context)?;
-                    sixel_vte.push_str(&serialized_sixel_image);
+                    vte_output.push_str(&serialized_sixel_image);
                 }
+            }
+            if has_sixel_output {
+                vte_output.push_str(RESTORE_CURSOR_POSITION);
             }
         }
     }
-    if let Some(ref sixel_vte) = sixel_vte {
-        // we do this at the end because of the implied z-index,
-        // images should be above text unless the text was explicitly inserted after them (the
-        // latter being a case we handle in our own internal state and not in the output)
-        let save_cursor_position = "\u{1b}[s";
-        let restore_cursor_position = "\u{1b}[u";
-        vte_output.push_str(save_cursor_position);
-        vte_output.push_str(sixel_vte);
-        vte_output.push_str(restore_cursor_position);
-    }
     if let Some(kitty_input) = kitty_input {
-        let kitty_vte = serialize_kitty_frame(kitty_input).with_context(err_context)?;
-        if !kitty_vte.is_empty() {
-            vte_output.push_str("\u{1b}[s");
-            vte_output.push_str(&kitty_vte);
-            vte_output.push_str("\u{1b}[u");
-        }
+        serialize_kitty_frame(kitty_input, vte_output).with_context(err_context)?;
     }
-    Ok(vte_output)
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1293,7 +1375,7 @@ fn emit_kitty_local_media(
     Ok(true)
 }
 
-fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
+fn serialize_kitty_frame(kitty_input: KittyFrameInput, out: &mut String) -> Result<()> {
     let err_context = "failed to serialize kitty frame";
     let KittyFrameInput {
         mut chunks_by_pane,
@@ -1305,7 +1387,7 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
         compressed,
         local_media,
     } = kitty_input;
-    let mut out = String::new();
+    let mut has_image_output = false;
     if host_display_cleared {
         host_state.live_placements.clear();
         for image_key in host_state.transmitted.keys().copied().collect::<Vec<_>>() {
@@ -1324,6 +1406,7 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
         .collect();
     freed.sort_by_key(|(_, host_id)| *host_id);
     for (image_key, host_id) in freed {
+        begin_image_output(out, &mut has_image_output);
         write!(out, "\u{1b}_Ga=d,q=2,d=I,i={}\u{1b}\\", host_id).context(err_context)?;
         host_state.transmitted.remove(&image_key);
         host_state.release_media_for_image(&image_key);
@@ -1342,6 +1425,7 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
             (pane_sort_key(key.pane_id), key.placement_uid, key.sub_index)
         });
         for (key, host_image_id, host_placement_id) in to_delete {
+            begin_image_output(out, &mut has_image_output);
             write!(
                 out,
                 "\u{1b}_Ga=d,q=2,d=i,i={},p={}\u{1b}\\",
@@ -1381,6 +1465,7 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
             .collect();
         stale.sort_by_key(|(key, _, _)| (key.placement_uid, key.sub_index));
         for (key, host_image_id, host_placement_id) in stale {
+            begin_image_output(out, &mut has_image_output);
             write!(
                 out,
                 "\u{1b}_Ga=d,q=2,d=i,i={},p={}\u{1b}\\",
@@ -1422,8 +1507,9 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                                 .map(|image| image.rgba.as_slice()),
                         };
                         if let Some(rgba) = rgba {
+                            begin_image_output(out, &mut has_image_output);
                             emitted = emit_kitty_local_media(
-                                &mut out,
+                                out,
                                 host_image_id,
                                 width,
                                 height,
@@ -1442,8 +1528,9 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                             Some(b64) => b64,
                             None => continue,
                         };
+                        begin_image_output(out, &mut has_image_output);
                         emit_kitty_transmit(
-                            &mut out,
+                            out,
                             host_image_id,
                             width,
                             height,
@@ -1476,7 +1563,8 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                     host_placement_id
                 },
             };
-            vte_goto_instruction(chunk.cell_x, chunk.cell_y, &mut out).context(err_context)?;
+            begin_image_output(out, &mut has_image_output);
+            vte_goto_instruction(chunk.cell_x, chunk.cell_y, out).context(err_context)?;
             write!(
                 out,
                 "\u{1b}_Ga=p,q=2,i={},p={},x={},y={},w={},h={},X={},Y={},z={},C=1\u{1b}\\",
@@ -1502,7 +1590,10 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
             );
         }
     }
-    Ok(out)
+    if has_image_output {
+        out.push_str(RESTORE_CURSOR_POSITION);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1806,6 +1897,7 @@ fn frame_builder_for(
     clients: &Rc<RefCell<HashMap<ClientId, StructuredClientState>>>,
     client_id: ClientId,
     cursor: Option<CursorState>,
+    max_size: Option<Size>,
 ) -> Option<FrameBuilder> {
     let mut clients = clients.borrow_mut();
     let state = clients.get_mut(&client_id)?;
@@ -1819,8 +1911,12 @@ fn frame_builder_for(
     }
     state.force_full_repaint = false;
     state.last_dims = Some((cols, rows));
-    let cursor = cursor.unwrap_or(state.last_cursor);
+    let mut cursor = cursor.unwrap_or(state.last_cursor);
     state.last_cursor = cursor;
+    if max_size.is_some_and(|size| !position_is_in_bounds(cursor.x as usize, cursor.y as usize, size))
+    {
+        cursor.visible = false;
+    }
     let mut builder = FrameBuilder::new(cols, rows, seq);
     builder.set_full_repaint(full_repaint);
     builder.set_clear(full_repaint);
@@ -1869,6 +1965,8 @@ pub(crate) fn mirror_screen_from_chunks(
         None,
         Some(&mut links),
         &mut builder,
+        None,
+        None,
         None,
     );
     let mut screen = match flattened {
@@ -1954,10 +2052,47 @@ fn append_sideband_instruction(sideband: &mut Vec<u8>, instruction: &str) {
     sideband.extend_from_slice(instruction.as_bytes());
 }
 
+#[derive(Clone, Debug)]
+enum PostVteInstruction {
+    Raw(String),
+    Cursor {
+        x: usize,
+        y: usize,
+        shape: Option<String>,
+    },
+}
+
+impl PostVteInstruction {
+    fn write(self, vte_output: &mut String, max_size: Option<Size>) -> Result<()> {
+        match self {
+            Self::Raw(vte) => vte_output.push_str(&vte),
+            Self::Cursor { x, y, shape } => {
+                if max_size.is_some_and(|size| !position_is_in_bounds(x, y, size)) {
+                    vte_hide_cursor_instruction(vte_output)?;
+                } else if let Some(shape) = shape {
+                    vte_output.push_str("\u{1b}[?25h");
+                    vte_goto_instruction(x, y, vte_output)?;
+                    vte_output.push_str(&shape);
+                } else {
+                    vte_hide_cursor_instruction(vte_output)?;
+                    write!(vte_output, "\u{1b}[{};{}H", y + 1, x + 1)?;
+                }
+            },
+        }
+        Ok(())
+    }
+
+    fn append_to_sideband(self, sideband: &mut Vec<u8>) {
+        if let Self::Raw(vte) = self {
+            append_sideband_instruction(sideband, &vte);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Output {
     pre_vte_instructions: HashMap<ClientId, Vec<String>>,
-    post_vte_instructions: HashMap<ClientId, Vec<String>>,
+    post_vte_instructions: HashMap<ClientId, Vec<PostVteInstruction>>,
     client_character_chunks: HashMap<ClientId, Vec<CharacterChunk>>,
     client_pane_rects: HashMap<ClientId, Vec<(PaneRect, PaneScroll)>>,
     sixel_chunks: HashMap<ClientId, Vec<SixelImageChunk>>,
@@ -2116,7 +2251,7 @@ impl Output {
                 .post_vte_instructions
                 .entry(client_id)
                 .or_insert_with(Vec::new);
-            entry.push(String::from(vte_instruction));
+            entry.push(PostVteInstruction::Raw(String::from(vte_instruction)));
         }
     }
     pub fn add_pre_vte_instruction_to_multiple_clients(
@@ -2152,7 +2287,23 @@ impl Output {
             .post_vte_instructions
             .entry(client_id)
             .or_insert_with(Vec::new);
-        entry.push(String::from(vte_instruction));
+        entry.push(PostVteInstruction::Raw(String::from(vte_instruction)));
+    }
+    pub(crate) fn add_post_vte_cursor_instruction_to_client(
+        &mut self,
+        client_id: ClientId,
+        x: usize,
+        y: usize,
+        cursor_shape: Option<&str>,
+    ) {
+        self.post_vte_instructions
+            .entry(client_id)
+            .or_default()
+            .push(PostVteInstruction::Cursor {
+                x,
+                y,
+                shape: cursor_shape.map(str::to_owned),
+            });
     }
     pub fn add_pre_vte_instruction_to_client(
         &mut self,
@@ -2297,6 +2448,14 @@ impl Output {
         self.client_kitty_visible_panes.insert(client_id, pane_ids);
     }
     pub fn serialize(&mut self) -> Result<HashMap<ClientId, RenderPayload>> {
+        self.serialize_with_client_bounds(|_| None)
+    }
+
+    /// Serialize a normal frame using each client's physical size and tab's logical size.
+    pub(crate) fn serialize_with_client_bounds(
+        &mut self,
+        bounds: impl Fn(ClientId) -> Option<(Size, Size)>,
+    ) -> Result<HashMap<ClientId, RenderPayload>> {
         let err_context = || "failed to serialize output to clients".to_string();
 
         let mut serialized_render_instructions = HashMap::new();
@@ -2308,6 +2467,12 @@ impl Output {
                 .get(&client_id)
                 .map(|state| state.enabled)
                 .unwrap_or(false);
+            let client_bounds = bounds(client_id);
+            let max_size = client_bounds.map(|(physical, content)| Size {
+                rows: physical.rows.min(content.rows),
+                cols: physical.cols.min(content.cols),
+            });
+            let character_cell_size = max_size.and_then(|_| *self.character_cell_size.borrow());
             let mut client_serialized_render_instructions = String::new();
 
             // append pre-vte instructions for this client
@@ -2318,6 +2483,7 @@ impl Output {
                     &self.structured_render_clients,
                     client_id,
                     self.client_cursor.get(&client_id).copied(),
+                    max_size,
                 )
                 .with_context(|| {
                     format!(
@@ -2341,6 +2507,14 @@ impl Output {
             if !structured {
                 for vte_instruction in &pre_vte_instructions_for_client {
                     client_serialized_render_instructions.push_str(vte_instruction);
+                }
+                if let Some((physical_size, content_size)) = client_bounds {
+                    write_client_padding(
+                        &mut client_serialized_render_instructions,
+                        physical_size,
+                        content_size,
+                    )
+                    .with_context(err_context)?;
                 }
             }
 
@@ -2369,10 +2543,17 @@ impl Output {
             let mut kitty_image_store;
             let mut kitty_host_state_map;
             let kitty_input = if client_host_is_kitty_capable {
+                let mut chunks_by_pane = kitty_chunks_by_pane.unwrap_or_default();
+                if let Some(size) = max_size {
+                    // Crop before diffing placements so stale parts are deleted on either wire.
+                    for chunks in chunks_by_pane.values_mut() {
+                        chunks.retain_mut(|chunk| clip_kitty_chunk(chunk, size, character_cell_size));
+                    }
+                }
                 kitty_image_store = self.kitty_image_store.borrow_mut();
                 kitty_host_state_map = self.kitty_host_state.borrow_mut();
                 Some(KittyFrameInput {
-                    chunks_by_pane: kitty_chunks_by_pane.unwrap_or_default(),
+                    chunks_by_pane,
                     rendered_panes: kitty_rendered_panes.unwrap_or_default(),
                     visible_panes: kitty_visible_panes.as_ref(),
                     kitty_image_store: &mut *kitty_image_store,
@@ -2393,10 +2574,22 @@ impl Output {
             };
 
             if let Some(mut builder) = structured_builder.take() {
-                let panes = self
+                let mut panes = self
                     .client_pane_rects
                     .remove(&client_id)
                     .unwrap_or_default();
+                if let Some(size) = max_size {
+                    let cols = size.cols.min(builder.cols() as usize) as u16;
+                    let rows = size.rows.min(builder.rows() as usize) as u16;
+                    panes.retain_mut(|(rect, _)| {
+                        if let Some(clipped) = rect.clip_to(cols, rows) {
+                            *rect = clipped;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
                 let geometry_pushed = push_geometry_if_changed(
                     &self.structured_render_clients,
                     client_id,
@@ -2428,6 +2621,8 @@ impl Output {
                     links.as_mut(),
                     &mut builder,
                     shifts_allowed.then_some(&panes[..]),
+                    max_size,
+                    character_cell_size,
                 )
                 .with_context(err_context)?;
                 drop(links);
@@ -2437,7 +2632,7 @@ impl Output {
                     self.post_vte_instructions.remove(&client_id)
                 {
                     for vte_instruction in post_vte_instructions_for_client {
-                        append_sideband_instruction(builder.sideband_mut(), &vte_instruction);
+                        vte_instruction.append_to_sideband(builder.sideband_mut());
                     }
                 }
                 push_scroll_hints(
@@ -2452,26 +2647,28 @@ impl Output {
                 continue;
             }
 
-            client_serialized_render_instructions.push_str(
-                &serialize_chunks(
-                    client_character_chunks,
-                    sixel_chunks_for_client,
-                    self.link_handler.as_mut(),
-                    Some(&mut self.sixel_image_store.borrow_mut()),
-                    self.styled_underlines,
-                    self.osc8_hyperlinks,
-                    None, // No size constraints for regular rendering
-                    kitty_input,
-                )
-                .with_context(err_context)?,
-            ); // TODO: less allocations?
+            serialize_chunks(
+                &mut client_serialized_render_instructions,
+                client_character_chunks,
+                sixel_chunks_for_client,
+                self.link_handler.as_mut(),
+                Some(&mut self.sixel_image_store.borrow_mut()),
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                max_size,
+                character_cell_size,
+                kitty_input,
+            )
+            .with_context(err_context)?;
 
             // append post-vte instructions for this client
             if let Some(post_vte_instructions_for_client) =
                 self.post_vte_instructions.remove(&client_id)
             {
                 for vte_instruction in post_vte_instructions_for_client {
-                    client_serialized_render_instructions.push_str(&vte_instruction);
+                    vte_instruction
+                        .write(&mut client_serialized_render_instructions, max_size)
+                        .with_context(err_context)?;
                 }
             }
             serialized_render_instructions.insert(
@@ -2520,7 +2717,8 @@ impl Output {
                 cursor
             });
 
-        let mut builder = frame_builder_for(&self.structured_render_clients, watcher_id, cursor)
+        let mut builder =
+            frame_builder_for(&self.structured_render_clients, watcher_id, cursor, None)
             .with_context(missing_record)
             .with_context(err_context)?;
 
@@ -2591,6 +2789,8 @@ impl Output {
             links.as_mut(),
             &mut builder,
             None,
+            None,
+            None,
         )
         .with_context(err_context)?;
         drop(links);
@@ -2602,7 +2802,7 @@ impl Output {
             .remove(&followed_client_id)
             .unwrap_or_default()
         {
-            append_sideband_instruction(builder.sideband_mut(), &vte_instruction);
+            vte_instruction.append_to_sideband(builder.sideband_mut());
         }
 
         push_scroll_hints(
@@ -2686,26 +2886,28 @@ impl Output {
             } else {
                 None
             };
-            client_serialized_render_instructions.push_str(
-                &serialize_chunks(
-                    client_character_chunks,
-                    sixel_chunks_for_client,
-                    self.link_handler.as_mut(),
-                    Some(&mut self.sixel_image_store.borrow_mut()),
-                    self.styled_underlines,
-                    self.osc8_hyperlinks,
-                    max_size,
-                    None,
-                )
-                .with_context(err_context)?,
-            );
+            serialize_chunks(
+                &mut client_serialized_render_instructions,
+                client_character_chunks,
+                sixel_chunks_for_client,
+                self.link_handler.as_mut(),
+                Some(&mut self.sixel_image_store.borrow_mut()),
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                max_size,
+                None,
+                None,
+            )
+            .with_context(err_context)?;
 
             // append post-vte instructions for this client
             if let Some(post_vte_instructions_for_client) =
                 self.post_vte_instructions.remove(&client_id)
             {
                 for vte_instruction in post_vte_instructions_for_client {
-                    client_serialized_render_instructions.push_str(&vte_instruction);
+                    vte_instruction
+                        .write(&mut client_serialized_render_instructions, None)
+                        .with_context(err_context)?;
                 }
             }
 

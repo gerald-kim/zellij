@@ -3113,11 +3113,17 @@ pub(crate) fn route_thread_main(
                                         s.session_configuration
                                             .get_client_default_input_mode(&client_id),
                                         key_actions,
+                                        s.resize_to_latest_input,
                                     ))
                                 });
-                            if let Some((senders, default_shell, client_input_mode, key_actions)) =
+                            if let Some((senders, default_shell, client_input_mode, key_actions, resize)) =
                                 dispatch_inputs
                             {
+                                if resize {
+                                    let _ = senders.send_to_screen(
+                                        ScreenInstruction::RecordClientInput(client_id),
+                                    );
+                                }
                                 for key_action in key_actions {
                                     let action = match key_action {
                                         PopupKeyAction::Route(action) => action,
@@ -3281,11 +3287,20 @@ pub(crate) fn route_thread_main(
                                         s.default_shell.clone(),
                                         s.session_configuration
                                             .get_client_default_input_mode(&client_id),
+                                        s.resize_to_latest_input,
                                     )
                                 });
-                            if let Some((senders, default_shell, client_input_mode)) =
+                            if let Some((senders, default_shell, client_input_mode, resize)) =
                                 session_data_assets
                             {
+                                if resize
+                                    && !is_cli_client
+                                    && matches!(&action, Action::Write { .. } | Action::Paste { .. })
+                                {
+                                    let _ = senders.send_to_screen(
+                                        ScreenInstruction::RecordClientInput(client_id),
+                                    );
+                                }
                                 match route_action(
                                     action,
                                     client_id,

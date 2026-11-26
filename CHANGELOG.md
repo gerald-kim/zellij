@@ -54,7 +54,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 * feat: terminal window (desktop client) on Windows, with the tray, notifications and the setup screen (https://github.com/zellij-org/zellij/pull/5679, https://github.com/zellij-org/zellij/pull/5831, https://github.com/zellij-org/zellij/pull/5832, https://github.com/zellij-org/zellij/pull/5833, https://github.com/zellij-org/zellij/pull/5844, https://github.com/zellij-org/zellij/pull/5846, https://github.com/zellij-org/zellij/pull/5848 and https://github.com/zellij-org/zellij/pull/5857)
 * fix: replies going to the wrong client on Windows after a client drops mid-connect (https://github.com/zellij-org/zellij/pull/5849)
 * fix: tighten pipe permissions on Windows, and small fixes for starting and reaching sessions, session names and paths (https://github.com/zellij-org/zellij/pull/5853, https://github.com/zellij-org/zellij/pull/5854 and https://github.com/zellij-org/zellij/pull/5855)
-
+* feat: opt in at session startup with `resize_to_latest_input true` to size each tab's shared PTYs to the client that last provided keyboard input or completed a mouse action in that tab
 
 ## [0.45.1] - 2026-08-28
 * fix: nested-session detection over SSH (https://github.com/zellij-org/zellij/pull/5522)

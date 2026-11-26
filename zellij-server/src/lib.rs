@@ -1087,6 +1087,7 @@ pub(crate) struct SessionMetaData {
     pub modal_popup_clients: HashSet<ClientId>,
     pub live_view_captures: crate::pane_mirror::SharedLiveViewCaptures,
     pub terminal_command_submitted: Arc<std::sync::atomic::AtomicBool>,
+    pub resize_to_latest_input: bool,
     pub web_sharing: WebSharing, // this is a special attribute explicitly set on session
     // initialization because we don't want it to be overridden by
     // configuration changes, the only way it can be overwritten is by
@@ -2727,6 +2728,7 @@ mod session_state_tests {
             modal_popup_clients: HashSet::new(),
             live_view_captures: Default::default(),
             terminal_command_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resize_to_latest_input: false,
             web_sharing: WebSharing::Off,
             screen_thread: None,
             pty_thread: None,
@@ -5775,6 +5777,7 @@ fn init_session(
             should_silently_fail: false,
         },
         default_shell,
+        resize_to_latest_input: config.options.resize_to_latest_input.unwrap_or(false),
         session_configuration: Default::default(),
         current_input_modes: HashMap::new(),
         screen_thread: Some(screen_thread),

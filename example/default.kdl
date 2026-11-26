@@ -394,6 +394,14 @@ context_menu {
 //
 // mirror_session true
 
+// Size each tab's shared PTYs to the client that last provided keyboard
+// input or completed a mouse action in that tab.
+// When disabled, use the smallest size among clients viewing the tab.
+// This setting is read at session startup; existing sessions are unchanged.
+// Default: false
+//
+// resize_to_latest_input true
+
 // The folder in which Zellij will look for layouts
 //
 // layout_dir "/path/to/my/layout_dir"

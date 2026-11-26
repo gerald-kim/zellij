@@ -123,6 +123,7 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         pane_frames,
         pane_frame_style,
         mirror_session,
+        resize_to_latest_input,
         on_force_close,
         scroll_buffer_size,
         copy_command,
@@ -206,6 +207,10 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
             pane_frame_style.as_ref().map(pane_frame_style_text),
         ),
         (SettingKey::MirrorSession, display_text(mirror_session)),
+        (
+            SettingKey::ResizeToLatestInput,
+            display_text(resize_to_latest_input),
+        ),
         (
             SettingKey::OnForceClose,
             on_force_close.as_ref().map(on_force_close_text),
@@ -934,6 +939,9 @@ pub fn copy_setting(target: &mut Config, source: &Config, key: SettingKey) {
         SettingKey::PaneFrames => options.pane_frames = from.pane_frames,
         SettingKey::PaneFrameStyle => options.pane_frame_style = from.pane_frame_style,
         SettingKey::MirrorSession => options.mirror_session = from.mirror_session,
+        SettingKey::ResizeToLatestInput => {
+            options.resize_to_latest_input = from.resize_to_latest_input
+        },
         SettingKey::OnForceClose => options.on_force_close = from.on_force_close,
         SettingKey::ScrollBufferSize => options.scroll_buffer_size = from.scroll_buffer_size,
         SettingKey::CopyCommand => options.copy_command = from.copy_command.clone(),

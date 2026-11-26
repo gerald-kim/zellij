@@ -1159,6 +1159,7 @@ impl From<crate::input::options::Options>
             mouse_mode: options.mouse_mode,
             pane_frames: options.pane_frames,
             mirror_session: options.mirror_session,
+            resize_to_latest_input: options.resize_to_latest_input,
             on_force_close: options.on_force_close.map(|o| match o {
                 crate::input::options::OnForceClose::Quit => ProtoOnForceClose::Quit as i32,
                 crate::input::options::OnForceClose::Detach => ProtoOnForceClose::Detach as i32,
@@ -1308,6 +1309,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
                 _ => None,
             }),
             mirror_session: options.mirror_session,
+            resize_to_latest_input: options.resize_to_latest_input,
             on_force_close: options
                 .on_force_close
                 .map(|o| match ProtoOnForceClose::try_from(o).ok() {

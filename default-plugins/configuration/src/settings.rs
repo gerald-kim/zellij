@@ -1052,6 +1052,13 @@ fn describe_entry(key: SettingKey) -> SettingInfo {
             "false",
             Everyone,
         ),
+        SettingKey::ResizeToLatestInput => info(
+            "Resize to latest input",
+            "Size shared tabs to the client that last provided input",
+            Toggle,
+            "false",
+            Everyone,
+        ),
         SettingKey::OnQuit => info(
             "On quit",
             "Ask (with quit or detach preselected), or quit or detach without asking",
@@ -1953,7 +1960,7 @@ pub fn placement(key: SettingKey) -> (Category, &'static str) {
         | ScrollbackLinesToSerialize
         | SerializationInterval
         | PostCommandDiscoveryHook => (C::Sessions, "Resurrection"),
-        MirrorSession | DisableSessionMetadata => (C::Sessions, "Behaviour"),
+        MirrorSession | ResizeToLatestInput | DisableSessionMetadata => (C::Sessions, "Behaviour"),
         TerminalFont
         | TerminalFontBold
         | TerminalFontItalic

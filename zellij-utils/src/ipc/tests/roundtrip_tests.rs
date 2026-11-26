@@ -520,6 +520,7 @@ fn test_client_messages() {
                 pane_frames: Some(true),
                 pane_frame_style: Some(PaneFrameStyle::Full),
                 mirror_session: Some(true),
+                resize_to_latest_input: Some(true),
                 on_force_close: Some(OnForceClose::Quit),
                 scroll_buffer_size: Some(100000),
                 copy_command: Some("copy_command".to_owned()),

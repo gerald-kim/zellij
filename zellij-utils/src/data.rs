@@ -5554,6 +5554,7 @@ setting_keys! {
     PaneFrames => (TopLevel, "pane_frames", false, Flag),
     PaneFrameStyle => (TopLevel, "pane_frame_style", false, Text),
     MirrorSession => (TopLevel, "mirror_session", true, Flag),
+    ResizeToLatestInput => (TopLevel, "resize_to_latest_input", true, Flag),
     OnForceClose => (TopLevel, "on_force_close", true, Text),
     ScrollBufferSize => (TopLevel, "scroll_buffer_size", true, Number),
     CopyCommand => (TopLevel, "copy_command", false, Text),
