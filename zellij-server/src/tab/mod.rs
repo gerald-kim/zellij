@@ -4966,17 +4966,11 @@ impl Tab {
                             })
                             .unwrap_or(true);
                         if output.is_dirty() || cursor_changed_position_or_shape {
-                            let show_cursor = "\u{1b}[?25h";
-                            let goto_cursor_position = &format!(
-                                "\u{1b}[{};{}H\u{1b}[m{}",
-                                cursor_position_y + 1,
-                                cursor_position_x + 1,
-                                desired_cursor_shape
-                            ); // goto row/col
-                            output.add_post_vte_instruction_to_client(client_id, show_cursor);
-                            output.add_post_vte_instruction_to_client(
+                            output.add_post_vte_cursor_instruction_to_client(
                                 client_id,
-                                goto_cursor_position,
+                                cursor_position_x,
+                                cursor_position_y,
+                                Some(&desired_cursor_shape),
                             );
                             self.cursor_positions_and_shape.insert(
                                 client_id,
@@ -4988,14 +4982,12 @@ impl Tab {
                         // pane. Position the host terminal cursor at the correct
                         // location (for IME) then hide it. The IME subsystem reads
                         // the cursor position regardless of visibility.
-                        let hide_cursor = "\u{1b}[?25l";
-                        let goto_cursor_position = &format!(
-                            "\u{1b}[{};{}H",
-                            cursor_position_y + 1,
-                            cursor_position_x + 1,
+                        output.add_post_vte_cursor_instruction_to_client(
+                            client_id,
+                            cursor_position_x,
+                            cursor_position_y,
+                            None,
                         );
-                        output.add_post_vte_instruction_to_client(client_id, hide_cursor);
-                        output.add_post_vte_instruction_to_client(client_id, goto_cursor_position);
                     } else {
                         let hide_cursor = "\u{1b}[?25l";
                         output.add_post_vte_instruction_to_client(client_id, hide_cursor);

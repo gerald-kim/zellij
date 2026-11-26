@@ -183,6 +183,10 @@ pub struct Options {
     #[serde(default)]
     /// Mirror session when multiple users are connected (true or false)
     pub mirror_session: Option<bool>,
+    #[clap(long, value_parser)]
+    #[serde(default)]
+    /// Size each tab to the client that last provided input to it (true or false)
+    pub resize_to_latest_input: Option<bool>,
     /// Set behaviour on force close (quit or detach)
     #[clap(long, value_enum, hide_possible_values = true, value_parser)]
     pub on_force_close: Option<OnForceClose>,
@@ -516,6 +520,7 @@ impl Options {
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let auto_layout = other.auto_layout.or(self.auto_layout);
         let mirror_session = other.mirror_session.or(self.mirror_session);
+        let resize_to_latest_input = other.resize_to_latest_input.or(self.resize_to_latest_input);
         let simplified_ui = other.simplified_ui.or(self.simplified_ui);
         let default_mode = other.default_mode.or(self.default_mode);
         let default_shell = other.default_shell.or_else(|| self.default_shell.clone());
@@ -619,6 +624,7 @@ impl Options {
             pane_frames,
             pane_frame_style,
             mirror_session,
+            resize_to_latest_input,
             on_force_close,
             scroll_buffer_size,
             copy_command,
@@ -687,6 +693,7 @@ impl Options {
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let auto_layout = merge_bool(other.auto_layout, self.auto_layout);
         let mirror_session = merge_bool(other.mirror_session, self.mirror_session);
+        let resize_to_latest_input = other.resize_to_latest_input.or(self.resize_to_latest_input);
         let session_serialization =
             merge_bool(other.session_serialization, self.session_serialization);
         let serialize_pane_viewport =
@@ -790,6 +797,7 @@ impl Options {
             pane_frames,
             pane_frame_style,
             mirror_session,
+            resize_to_latest_input,
             on_force_close,
             scroll_buffer_size,
             copy_command,

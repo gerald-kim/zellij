@@ -339,6 +339,7 @@ pub(crate) struct SessionMetaData {
     pub current_input_modes: HashMap<ClientId, InputMode>,
     pub session_configuration: SessionConfiguration,
     pub key_passthrough_clients: HashMap<ClientId, PaneId>,
+    pub resize_to_latest_input: bool,
     pub web_sharing: WebSharing, // this is a special attribute explicitly set on session
     // initialization because we don't want it to be overridden by
     // configuration changes, the only way it can be overwritten is by
@@ -2328,6 +2329,7 @@ fn init_session(
             should_silently_fail: false,
         },
         default_shell,
+        resize_to_latest_input: config.options.resize_to_latest_input.unwrap_or(false),
         session_configuration: Default::default(),
         current_input_modes: HashMap::new(),
         screen_thread: Some(screen_thread),

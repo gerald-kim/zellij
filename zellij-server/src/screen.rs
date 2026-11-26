@@ -542,6 +542,7 @@ pub enum ScreenInstruction {
         completion_tx: Option<NotificationEnd>,
     },
     RecomputeTabSize(ClientId, Size),
+    RecordClientInput(ClientId),
     TerminalPixelDimensions(ClientId, PixelDimensions),
     TerminalBackgroundColor(String),
     TerminalForegroundColor(String),
@@ -1092,6 +1093,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::RenameTabWithId(..) => ScreenContext::RenameTabWithId,
             ScreenInstruction::BreakPanesToTabWithId { .. } => ScreenContext::BreakPanesToTabWithId,
             ScreenInstruction::RecomputeTabSize(..) => ScreenContext::RecomputeTabSize,
+            ScreenInstruction::RecordClientInput(..) => ScreenContext::RecordClientInput,
             ScreenInstruction::TerminalPixelDimensions(..) => {
                 ScreenContext::TerminalPixelDimensions
             },
@@ -1553,6 +1555,9 @@ pub(crate) struct Screen {
     serialize_pane_viewport: bool,
     scrollback_lines_to_serialize: Option<usize>,
     session_is_mirrored: bool,
+    resize_to_latest_input: bool,
+    // Oldest to newest, with a fallback viewer seeded before the first input.
+    latest_tab_inputs: Vec<(ClientId, usize)>,
     copy_options: CopyOptions,
     debug: bool,
     session_name: String,
@@ -1763,6 +1768,8 @@ impl Screen {
             pane_frame_style,
             auto_layout,
             session_is_mirrored,
+            resize_to_latest_input: false,
+            latest_tab_inputs: Vec::new(),
             copy_options,
             debug,
             session_name,
@@ -2262,6 +2269,7 @@ impl Screen {
         let err_context = || format!("failed to close tab at index {tab_id:?}");
 
         let mut tab_to_close = self.tabs.remove(&tab_id).with_context(err_context)?;
+        self.latest_tab_inputs.retain(|(_, tab)| *tab != tab_id);
         let mut pane_ids = tab_to_close.get_all_pane_ids();
 
         // here we extract the suppressed panes (these are background panes that don't care which
@@ -2384,9 +2392,77 @@ impl Screen {
         })
     }
 
-    pub fn recompute_tab_size(&mut self, tab_id: usize) -> Result<()> {
-        let err_context = || format!("failed to recompute size for tab {tab_id}");
+    fn latest_input_size(&mut self, tab_id: usize) -> Option<Size> {
+        let viewer_size = |client_id: &ClientId| {
+            if self.active_tab_ids.get(client_id) == Some(&tab_id)
+                && !self.mobile_web_prefs.get(client_id).is_some_and(|prefs| !prefs.fit)
+            {
+                self.client_sizes.get(client_id).copied()
+            } else {
+                None
+            }
+        };
+        if let Some(size) = self
+            .latest_tab_inputs
+            .iter()
+            .rev()
+            .filter(|(_, input_tab)| *input_tab == tab_id)
+            .find_map(|(client_id, _)| viewer_size(client_id))
+        {
+            return Some(size);
+        }
+        let (client_id, size) = self
+            .active_tab_ids
+            .keys()
+            .find_map(|id| viewer_size(id).map(|size| (*id, size)))?;
+        // Keep the initial viewer in charge even if a new client reuses a lower ID.
+        self.latest_tab_inputs.retain(|(id, _)| *id != client_id);
+        self.latest_tab_inputs.insert(0, (client_id, tab_id));
+        Some(size)
+    }
 
+    fn record_client_input(&mut self, client_id: ClientId) -> Result<()> {
+        if !self.resize_to_latest_input {
+            return Ok(());
+        }
+        let Some(&tab_id) = self.active_tab_ids.get(&client_id) else {
+            return Ok(());
+        };
+        let entry = (client_id, tab_id);
+        if self.latest_tab_inputs.last() == Some(&entry) {
+            return Ok(());
+        }
+        self.latest_tab_inputs.retain(|(id, _)| *id != client_id);
+        self.latest_tab_inputs.push(entry);
+        let previous_size = self.tabs.get(&tab_id).map(|tab| tab.size);
+        self.recompute_tab_size(tab_id)?;
+        if previous_size != self.tabs.get(&tab_id).map(|tab| tab.size) {
+            self.log_and_report_session_state()?;
+            self.render(None)?;
+        }
+        Ok(())
+    }
+
+    pub fn recompute_tab_size(&mut self, tab_id: usize) -> Result<()> {
+        let new_size = if self.resize_to_latest_input {
+            self.latest_input_size(tab_id)
+        } else {
+            None
+        };
+        let Some(new_size) = new_size.or_else(|| self.minimum_tab_size(tab_id)) else {
+            return Ok(());
+        };
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if tab.size != new_size {
+                tab.resize_whole_tab(new_size)
+                    .with_context(|| format!("failed to recompute size for tab {tab_id}"))?;
+                tab.set_force_render();
+            }
+        }
+        Ok(())
+    }
+
+    fn minimum_tab_size(&self, tab_id: usize) -> Option<Size> {
         let mut rows: Vec<usize> = Vec::new();
         let mut cols: Vec<usize> = Vec::new();
         let mut fit_disabled_clients: Vec<ClientId> = Vec::new();
@@ -2413,22 +2489,10 @@ impl Screen {
                 cols.push(reference.cols);
             }
         }
-        if rows.is_empty() || cols.is_empty() {
-            return Ok(());
-        }
-        rows.sort_unstable();
-        cols.sort_unstable();
-        let new_size = Size {
-            rows: rows[0],
-            cols: cols[0],
-        };
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
-            if tab.size != new_size {
-                tab.resize_whole_tab(new_size).with_context(err_context)?;
-                tab.set_force_render();
-            }
-        }
-        Ok(())
+        Some(Size {
+            rows: rows.into_iter().min()?,
+            cols: cols.into_iter().min()?,
+        })
     }
 
     fn recompute_fit_disabled_tabs(&mut self) -> Result<()> {
@@ -4284,7 +4348,17 @@ impl Screen {
             }
 
             if non_watcher_output_was_dirty || has_bell {
-                let serialized_output = output.serialize().context(err_context)?;
+                let serialized_output = if self.resize_to_latest_input {
+                    output.serialize_with_client_bounds(|client_id| {
+                        let client_size = *self.client_sizes.get(&client_id)?;
+                        let tab_size = self.tabs.get(self.active_tab_ids.get(&client_id)?)?.size;
+                        (client_size.rows < tab_size.rows || client_size.cols < tab_size.cols)
+                            .then_some((client_size, tab_size))
+                    })
+                } else {
+                    output.serialize()
+                }
+                .context(err_context)?;
                 if !serialized_output.is_empty() {
                     let _ = self
                         .bus
@@ -5187,6 +5261,7 @@ impl Screen {
             self.push_sixel_host_support_to_tabs();
         }
         self.client_sizes.remove(&client_id);
+        self.latest_tab_inputs.retain(|(id, _)| *id != client_id);
         self.pane_render_subscribers.remove(&client_id);
         self.client_host_focused.remove(&client_id);
         self.client_notification_protocols.remove(&client_id);
@@ -8190,6 +8265,7 @@ pub(crate) fn screen_thread_main(
         web_server_port,
         nested_session_handling,
     );
+    screen.resize_to_latest_input = config_options.resize_to_latest_input.unwrap_or(false);
     screen.host_theme_dark_styling = host_theme_dark_styling;
     screen.host_theme_light_styling = host_theme_light_styling;
     screen.paste_buffer_read_enabled = dangerously_enable_paste_buffer_read;
@@ -10032,6 +10108,8 @@ pub(crate) fn screen_thread_main(
                 }
             },
             ScreenInstruction::RecomputeTabSize(client_id, new_size) => {
+                let changed = screen.resize_to_latest_input
+                    && screen.client_sizes.get(&client_id) != Some(&new_size);
                 screen.set_client_size(client_id, new_size);
                 if screen.tabs.is_empty() {
                     continue;
@@ -10039,6 +10117,13 @@ pub(crate) fn screen_thread_main(
                 let active_tab_id = screen.active_tab_ids.get(&client_id).copied();
                 if let Some(tab_id) = active_tab_id {
                     screen.recompute_tab_size(tab_id)?;
+                    if changed {
+                        // The physical viewport may change even when the shared tab does not.
+                        if let Some(tab) = screen.tabs.get_mut(&tab_id) {
+                            tab.set_should_clear_display_before_rendering();
+                            tab.set_force_render();
+                        }
+                    }
                 }
                 if !screen.client_is_web(client_id) {
                     screen.recompute_fit_disabled_tabs()?;
@@ -10047,6 +10132,9 @@ pub(crate) fn screen_thread_main(
                     screen.log_and_report_session_state()?;
                     screen.render(None)?;
                 }
+            },
+            ScreenInstruction::RecordClientInput(client_id) => {
+                screen.record_client_input(client_id)?;
             },
             ScreenInstruction::TerminalPixelDimensions(client_id, pixel_dimensions) => {
                 let character_cell_size_changed =
@@ -10175,6 +10263,15 @@ pub(crate) fn screen_thread_main(
                                 // waiting for it
             ) => {
                 screen.handle_mouse_event(event, client_id);
+                // Let clicks and drags finish against the layout the user saw.
+                if event.event_type == MouseEventType::Release
+                    || event.wheel_up
+                    || event.wheel_down
+                    || event.wheel_left
+                    || event.wheel_right
+                {
+                    screen.record_client_input(client_id)?;
+                }
             },
             ScreenInstruction::Copy(
                 client_id,

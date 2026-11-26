@@ -314,6 +314,7 @@ pub enum ScreenContext {
     RenameTabWithId,
     BreakPanesToTabWithId,
     RecomputeTabSize,
+    RecordClientInput,
     TerminalPixelDimensions,
     TerminalBackgroundColor,
     TerminalForegroundColor,

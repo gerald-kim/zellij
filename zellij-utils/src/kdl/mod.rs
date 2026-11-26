@@ -2834,6 +2834,9 @@ impl Options {
                 .map(|(string, _entry)| PathBuf::from(string));
         let mirror_session =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mirror_session").map(|(v, _)| v);
+        let resize_to_latest_input =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "resize_to_latest_input")
+                .map(|(v, _)| v);
         let session_name = kdl_property_first_arg_as_string_or_error!(kdl_options, "session_name")
             .map(|(session_name, _entry)| session_name.to_string());
         let attach_to_session =
@@ -3007,6 +3010,7 @@ impl Options {
             pane_frames,
             pane_frame_style,
             mirror_session,
+            resize_to_latest_input,
             on_force_close,
             scroll_buffer_size,
             copy_command,
@@ -3524,6 +3528,30 @@ impl Options {
         } else {
             None
         }
+    }
+    fn resize_to_latest_input_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        if self.resize_to_latest_input.is_none() && !add_comments {
+            return None;
+        }
+
+        let mut node = KdlNode::new("resize_to_latest_input");
+        node.push(KdlValue::Bool(self.resize_to_latest_input.unwrap_or(true)));
+        if add_comments {
+            let comment_text = " \n\
+                                // Size each tab's shared PTYs to the client that last provided keyboard\n\
+                                // input or completed a mouse action in that tab.\n\
+                                // When disabled, use the smallest size among clients viewing the tab.\n\
+                                // This setting is read at session startup; existing sessions are unchanged.\n\
+                                // Default: false\n\
+                                // \n";
+            let prefix = if self.resize_to_latest_input.is_none() {
+                "// "
+            } else {
+                ""
+            };
+            node.set_leading(format!("{comment_text}{prefix}"));
+        }
+        Some(node)
     }
     fn on_force_close_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
@@ -4830,6 +4858,9 @@ impl Options {
         }
         if let Some(mirror_session) = self.mirror_session_to_kdl(add_comments) {
             nodes.push(mirror_session);
+        }
+        if let Some(resize_to_latest_input) = self.resize_to_latest_input_to_kdl(add_comments) {
+            nodes.push(resize_to_latest_input);
         }
         if let Some(on_force_close) = self.on_force_close_to_kdl(add_comments) {
             nodes.push(on_force_close);
@@ -7832,6 +7863,7 @@ fn config_options_to_string() {
         mouse_mode false
         pane_frames false
         mirror_session true
+        resize_to_latest_input true
         on_force_close "quit"
         scroll_buffer_size 100
         copy_command "pbcopy"
@@ -8056,6 +8088,19 @@ fn bare_config_from_default_assets_to_string_with_comments() {
         "Deserialized serialized config equals original config"
     );
     insta::assert_snapshot!(fake_config_stringified);
+}
+
+#[test]
+fn resize_to_latest_input_config_override_and_roundtrip() {
+    let enabled = Config::from_kdl("resize_to_latest_input true", None).unwrap();
+    assert_eq!(enabled.options.resize_to_latest_input, Some(true));
+
+    let disabled = Config::from_kdl("resize_to_latest_input false", Some(enabled)).unwrap();
+    assert_eq!(disabled.options.resize_to_latest_input, Some(false));
+
+    let serialized = disabled.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options.resize_to_latest_input, Some(false));
 }
 
 #[test]

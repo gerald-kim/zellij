@@ -729,6 +729,61 @@ fn detaching_one_client_reflows_the_remaining_client() {
 }
 
 #[test]
+fn latest_input_sets_shared_tab_size_without_detaching_the_other_client() {
+    let mut zellij = TestRunner::new(TERMINAL_SIZE)
+        .with_config("resize_to_latest_input true")
+        .start();
+    let pane = claim_first_terminal_and_wait_for_prompt(&zellij);
+    mark_pane(zellij.main_client(), &pane, "shared");
+
+    let peer = zellij.attach_client(SMALLER_CLIENT_SIZE);
+    peer.wait_until("smaller client renders the shared tab", |grid| {
+        grid.contains("shared")
+    });
+    pane.wait_for_size(
+        "attaching without input does not shrink the pane",
+        |cols, rows| (cols, rows) == pane_size_in_tab_sized(TERMINAL_SIZE),
+    );
+
+    pane.output(b"\x1b[3;108Hclipped\x1b[4;1Hvisible-after");
+    zellij.wait_until("large viewer sees the whole pane", |grid| {
+        grid.contains("clipped") && grid.contains("visible-after")
+    });
+    let peer_grid = peer.wait_until("small viewer sees the same pane update", |grid| {
+        grid.contains("visible-after")
+    });
+    assert!(!peer_grid.contains("clipped"));
+
+    peer.send_stdin(&keys::key('s'));
+    pane.wait_for_size("the smaller client takes over on input", |cols, rows| {
+        (cols, rows) == pane_size_in_tab_sized(SMALLER_CLIENT_SIZE)
+    });
+    pane.wait_for_stdin("the key that takes control is delivered", |bytes| {
+        bytes.ends_with(b"s")
+    });
+
+    zellij.main_client().send_stdin(&keys::key('l'));
+    pane.wait_for_size("the large client takes back the shared tab", |cols, rows| {
+        (cols, rows) == pane_size_in_tab_sized(TERMINAL_SIZE)
+    });
+
+    peer.send_stdin(&keys::ctrl('t'));
+    peer.send_stdin(&keys::key('n'));
+    let peer_pane = zellij.expect_pty_spawn();
+    mark_pane(&peer, &peer_pane, "separate");
+    peer_pane.wait_for_size("the peer's own tab fits the peer", |cols, rows| {
+        (cols, rows) == pane_size_in_tab_sized(SMALLER_CLIENT_SIZE)
+    });
+    pane.wait_for_size(
+        "leaving the shared tab restores the remaining viewer's size",
+        |cols, rows| (cols, rows) == pane_size_in_tab_sized(TERMINAL_SIZE),
+    );
+
+    peer.quit();
+    zellij.quit();
+}
+
+#[test]
 fn moving_a_pane_to_another_tab_recomputes_both_tabs_sizes() {
     let mut zellij = start_zellij();
     let first_terminal = claim_first_terminal_and_wait_for_prompt(&zellij);

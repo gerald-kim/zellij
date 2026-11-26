@@ -361,6 +361,72 @@ fn test_serialize_drains_state() {
 }
 
 #[test]
+fn client_bounds_crop_text_and_cursor_only_for_the_bounded_client() {
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(2);
+    output.add_clients(&client_ids, Rc::new(RefCell::new(LinkHandler::new())), None);
+    output
+        .add_character_chunks_to_multiple_clients(
+            vec![
+                create_character_chunk_from_str("A界Z", 1, 0),
+                create_character_chunk_from_str("below", 0, 2),
+            ],
+            client_ids.iter().copied(),
+            None,
+        )
+        .unwrap();
+    output.add_pre_vte_instruction_to_client(1, "\u{1b}[?25l");
+    output.add_post_vte_cursor_instruction_to_client(1, 1, 2, Some("\u{1b}[2 q"));
+    output.add_post_vte_cursor_instruction_to_client(2, 1, 0, Some("\u{1b}[2 q"));
+    output.add_post_vte_instruction_to_multiple_clients(client_ids.iter().copied(), "\u{7}");
+
+    let result = output
+        .serialize_with_client_bounds(|client_id| {
+            (client_id == 1).then_some((Size { rows: 2, cols: 5 }, Size { rows: 4, cols: 3 }))
+        })
+        .unwrap();
+    let bounded = &result[&1];
+    assert!(bounded.starts_with("\u{1b}[?25l"));
+    assert!(bounded.contains("\u{1b}[1;2H\u{1b}[mA"));
+    assert!(!bounded.contains('界'));
+    assert!(!bounded.contains("below"));
+    assert!(!bounded.contains("\u{1b}[?25h"));
+    assert!(!bounded.contains("\u{1b}[3;2H"));
+    assert!(bounded.ends_with("\u{1b}[?25l\u{7}"));
+    assert!(bounded.contains("\u{1b}[1;4H\u{1b}[m\u{1b}[K"));
+    assert!(bounded.contains("\u{1b}[2;4H\u{1b}[m\u{1b}[K"));
+    assert_eq!(bounded.matches("\u{1b}[K").count(), 2);
+    assert!(!bounded.contains("\u{1b}[J"));
+
+    let unbounded = &result[&2];
+    assert!(unbounded.contains("A界Z"));
+    assert!(unbounded.contains("below"));
+    assert!(unbounded.ends_with("\u{1b}[?25h\u{1b}[1;2H\u{1b}[m\u{1b}[2 q\u{7}"));
+    assert!(!unbounded.contains("\u{1b}[K"));
+    assert!(!output.is_dirty());
+    assert!(output.serialize().unwrap().is_empty());
+}
+
+#[test]
+fn client_bounds_pad_only_the_bottom_when_the_client_is_narrower() {
+    let mut output = create_test_output();
+    output.add_clients(
+        &create_test_clients(1),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        None,
+    );
+    output.add_post_vte_cursor_instruction_to_client(1, 0, 1, None);
+
+    let result = output
+        .serialize_with_client_bounds(|_| Some((Size { rows: 5, cols: 2 }, Size { rows: 3, cols: 4 })))
+        .unwrap();
+    assert_eq!(
+        result[&1],
+        "\u{1b}[s\u{1b}[4;1H\u{1b}[m\u{1b}[J\u{1b}[u\u{1b}[?25l\u{1b}[2;1H"
+    );
+}
+
+#[test]
 fn test_serialize_with_size_no_constraints() {
     let mut output = create_test_output();
     let client_ids = create_test_clients(1);
@@ -1281,6 +1347,40 @@ fn parse_kitty_placement_crops(output: &str) -> Vec<(usize, usize, usize, usize,
         search_start = absolute_position + marker.len();
     }
     crops
+}
+
+#[test]
+fn client_bounds_crop_kitty_placements_without_losing_host_state() {
+    let parts = create_test_kitty_parts();
+    let internal = store_test_kitty_image(&parts.0, 30, 40);
+    let mut visible = kitty_chunk(internal, 1, 1, 1);
+    visible.cell_offset_x = 2;
+    visible.cell_offset_y = 3;
+    let clipped = kitty_chunk(internal, 2, 1, 2);
+    let render = |chunks| {
+        let mut output = create_test_kitty_output(&parts);
+        output.add_clients(
+            &create_test_clients(1),
+            Rc::new(RefCell::new(LinkHandler::new())),
+            None,
+        );
+        output.add_kitty_image_chunks_to_client(1, PaneId::Terminal(1), chunks, None);
+        output
+            .serialize_with_client_bounds(|_| {
+                Some((Size { rows: 2, cols: 2 }, Size { rows: 4, cols: 4 }))
+            })
+            .unwrap()
+            .remove(&1)
+            .unwrap()
+    };
+
+    let first = render(vec![visible, clipped]);
+    assert!(first.contains("\u{1b}_Ga=t"));
+    assert_eq!(parse_kitty_placement_crops(&first), vec![(1, 1, 0, 0, 8, 17)]);
+    assert!(render(vec![visible, clipped]).is_empty());
+    let removed = render(vec![clipped]);
+    assert!(removed.contains("\u{1b}_Ga=d,q=2,d=i"));
+    assert!(!removed.contains("\u{1b}_Ga=p"));
 }
 
 #[test]
